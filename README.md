@@ -1,6 +1,14 @@
+<div align="center">
+
 # reqs
 
-blazing-fast HTTP/HTTPS benchmarking tool
+![Linux](https://img.shields.io/badge/made%20for-linux-yellow?logo=linux&logoColor=ffffff) 
+[![Rust](https://img.shields.io/badge/made%20with-Rust-orange?logo=rust&amp;logoColor=ffffff)](https://rust-lang.org/) 
+[![License: GPL v3](https://img.shields.io/badge/License-AGPLv3-red.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
+Blazing-fast HTTP/HTTPS benchmarking tool
+
+</div>
 
 ```js
 reqs -c 500 -d 25s http://localhost/status
