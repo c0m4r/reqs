@@ -136,7 +136,7 @@ struct RespInfo {
 
 enum AnyStream {
     Plain(TcpStream),
-    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for AnyStream {
@@ -182,7 +182,15 @@ impl AsyncWrite for AnyStream {
 // ── TLS certificate verifier (--insecure) ─────────────────────────────────────
 
 #[derive(Debug)]
-struct NoCertVerifier;
+struct NoCertVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl NoCertVerifier {
+    fn new() -> Self {
+        Self { provider: Arc::new(rustls::crypto::ring::default_provider()) }
+    }
+}
 
 impl ServerCertVerifier for NoCertVerifier {
     fn verify_server_cert(
@@ -206,7 +214,7 @@ impl ServerCertVerifier for NoCertVerifier {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
@@ -220,14 +228,12 @@ impl ServerCertVerifier for NoCertVerifier {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
 
@@ -239,8 +245,11 @@ async fn tcp_connect(target: &Target, tls: Option<&TlsConnector>) -> io::Result<
     if target.is_https {
         let sn = ServerName::try_from(target.host.clone())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let tls_stream = tls.unwrap().connect(sn, tcp).await?;
-        Ok(AnyStream::Tls(tls_stream))
+        let tls_stream = tls
+            .expect("TLS connector missing for HTTPS target")
+            .connect(sn, tcp)
+            .await?;
+        Ok(AnyStream::Tls(Box::new(tls_stream)))
     } else {
         Ok(AnyStream::Plain(tcp))
     }
@@ -297,35 +306,22 @@ async fn read_response_headers<R: AsyncBufRead + Unpin>(
         if line == b"\r\n" || line == b"\n" {
             break;
         }
-        // Branch on first byte to avoid lowercasing every header
+        // Branch on first byte to avoid lowercasing every header.
+        // eq_ignore_ascii_case / windows comparison avoids heap allocation.
         match line[0].to_ascii_lowercase() {
             b'c' => {
-                // Could be Content-Length or Connection
-                let pfx = &line[..line.len().min(20)];
-                let pfx_lo: Vec<u8> = pfx.iter().map(|b| b.to_ascii_lowercase()).collect();
-                if pfx_lo.starts_with(b"content-length:") {
-                    let v = std::str::from_utf8(&line[15..])
-                        .unwrap_or("")
-                        .trim();
+                if line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
+                    let v = std::str::from_utf8(&line[15..]).unwrap_or("").trim();
                     content_length = v.parse().ok();
-                } else if pfx_lo.starts_with(b"connection:") {
-                    let v: Vec<u8> = line[11..]
-                        .iter()
-                        .map(|b| b.to_ascii_lowercase())
-                        .collect();
-                    connection_close = v.windows(5).any(|w| w == b"close");
+                } else if line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"connection:") {
+                    connection_close =
+                        line[11..].windows(5).any(|w| w.eq_ignore_ascii_case(b"close"));
                 }
             }
             b't' => {
-                // Transfer-Encoding
-                let pfx = &line[..line.len().min(20)];
-                let pfx_lo: Vec<u8> = pfx.iter().map(|b| b.to_ascii_lowercase()).collect();
-                if pfx_lo.starts_with(b"transfer-encoding:") {
-                    let v: Vec<u8> = line[18..]
-                        .iter()
-                        .map(|b| b.to_ascii_lowercase())
-                        .collect();
-                    is_chunked = v.windows(7).any(|w| w == b"chunked");
+                if line.len() >= 18 && line[..18].eq_ignore_ascii_case(b"transfer-encoding:") {
+                    is_chunked =
+                        line[18..].windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked"));
                 }
             }
             _ => {}
@@ -375,12 +371,21 @@ async fn drain_chunked<R: AsyncBufRead + Unpin>(
             .trim()
             .split(';')
             .next()
-            .unwrap_or("0");
-        let chunk_size = u64::from_str_radix(hex.trim(), 16).unwrap_or(0);
+            .unwrap_or("");
+        let chunk_size = u64::from_str_radix(hex.trim(), 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
         if chunk_size == 0 {
-            // Trailing CRLF after last chunk
-            line.clear();
-            reader.read_until(b'\n', line).await?;
+            // Drain optional trailer headers until the blank terminator line.
+            // HTTP/1.1 chunked encoding allows trailers between "0\r\n" and
+            // the final "\r\n"; reading only one line would leave them in the
+            // BufReader and corrupt the next pipelined response.
+            loop {
+                line.clear();
+                reader.read_until(b'\n', line).await?;
+                if line == b"\r\n" || line == b"\n" || line.is_empty() {
+                    break;
+                }
+            }
             break;
         }
         drain_exact(reader, chunk_size, buf).await?;
@@ -392,7 +397,7 @@ async fn drain_chunked<R: AsyncBufRead + Unpin>(
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
-async fn worker(
+struct WorkerConfig {
     target:         Arc<Target>,
     req_bytes:      Arc<Vec<u8>>,
     tls:            Option<Arc<TlsConnector>>,
@@ -402,7 +407,13 @@ async fn worker(
     collect_status: bool,
     pipeline:       usize,
     no_keepalive:   bool,
-) -> WorkerResult {
+}
+
+async fn worker(cfg: WorkerConfig) -> WorkerResult {
+    let WorkerConfig {
+        target, req_bytes, tls, timeout_dur, state,
+        target_n, collect_status, pipeline, no_keepalive,
+    } = cfg;
     let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 4).unwrap();
     let mut statuses: HashMap<u16, u64> = HashMap::new();
     let mut done   = 0u64;
@@ -420,7 +431,9 @@ async fn worker(
 
     'outer: loop {
         if state.stop.load(Ordering::Relaxed) {
-            let _ = conn_retries; // discard pending retries when stopping
+            // stop is only set in duration mode (target_n is None),
+            // so conn_retries hold no claimed -n slots — safe to discard.
+            let _ = conn_retries;
             break;
         }
 
@@ -543,6 +556,9 @@ async fn worker(
                         // keepalive_requests limit).  Save them as retries so they
                         // are re-sent on the next connection without claiming new
                         // slots — this gives zero spurious failures.
+                        // With no_keepalive, connection_closing is always true and the
+                        // just-completed request was already popped from inflight, so
+                        // inflight.len() == 0 here and conn_retries increases by 0.
                         conn_retries += inflight.len();
                         inflight.clear();
                         continue 'outer; // reconnect immediately
@@ -776,7 +792,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("TLS protocol config error: {e}"))?;
         let cfg = if insecure {
             base.dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+                .with_custom_certificate_verifier(Arc::new(NoCertVerifier::new()))
                 .with_no_client_auth()
         } else {
             let mut roots = rustls::RootCertStore::empty();
@@ -820,17 +836,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Spawn worker tasks
         let mut handles = Vec::with_capacity(connections);
         for _ in 0..connections {
-            handles.push(tokio::spawn(worker(
-                Arc::clone(&target),
-                Arc::clone(&req_bytes),
-                tls_connector.clone(),
+            handles.push(tokio::spawn(worker(WorkerConfig {
+                target:         Arc::clone(&target),
+                req_bytes:      Arc::clone(&req_bytes),
+                tls:            tls_connector.clone(),
                 timeout_dur,
-                Arc::clone(&state),
+                state:          Arc::clone(&state),
                 target_n,
                 collect_status,
                 pipeline,
                 no_keepalive,
-            )));
+            })));
         }
 
         // Progress reporter + duration-based stop signal
@@ -919,7 +935,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Data recv:  {}", fmt_bytes(total_bytes));
         println!("  Throughput: {}/s", fmt_bytes(tput as u64));
 
-        if hist.len() > 0 {
+        if !hist.is_empty() {
             println!("{sep}");
             println!("  Latency:");
             println!("    Min    {}", fmt_us(hist.min()));
