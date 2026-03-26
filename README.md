@@ -44,10 +44,10 @@ Target: http://localhost/status
 ### Standalone
 
 ```bash
-wget https://github.com/c0m4r/reqs/releases/download/0.1.0/reqs-0.1.0-1.x86_64
-echo "40d3a68ba83b0cdcc57171b9a8803a40ff51adf0ffd17799154607333a4988c3 reqs" | sha256sum -c || rm -f reqs-0.1.0-1.x86_64
-chmod +x reqs-0.1.0-1.x86_64
-sudo mv reqs-0.1.0-1.x86_64 /usr/local/bin/reqs
+wget https://github.com/c0m4r/reqs/releases/download/0.1.0/reqs-0.1.0-1.x86_64 -O reqs
+echo "40d3a68ba83b0cdcc57171b9a8803a40ff51adf0ffd17799154607333a4988c3 reqs" | sha256sum -c || rm -f reqs
+chmod +x reqs
+sudo mv reqs /usr/local/bin/
 ```
 
 ### Debian / Ubuntu
