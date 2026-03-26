@@ -398,8 +398,14 @@ async fn worker(
     let mut line = Vec::<u8>::with_capacity(256);
     let pipeline = pipeline.max(1);
 
+    // Requests that were in-flight when the server closed the connection.
+    // Their slots are already claimed; we re-send them on the new connection
+    // without claiming new slots, giving zero "spurious" failures.
+    let mut conn_retries: usize = 0;
+
     'outer: loop {
         if state.stop.load(Ordering::Relaxed) {
+            let _ = conn_retries; // discard pending retries when stopping
             break;
         }
 
@@ -407,6 +413,8 @@ async fn worker(
         let stream = match tcp_connect(&target, tls.as_deref()).await {
             Ok(s) => s,
             Err(_) => {
+                // Discard retries — the connection itself is unavailable.
+                conn_retries = 0;
                 // In -n mode consume one slot so we make progress toward the
                 // limit even when every connection attempt fails.
                 if let Some(n) = target_n {
@@ -432,16 +440,24 @@ async fn worker(
         let mut quota_done = false; // true when -n quota is exhausted
 
         // ── Initial pipeline fill ─────────────────────────────────────────
+        // Retries (from a previous connection close) are sent first and do not
+        // consume a new slot; remaining slots are claimed from the shared counter.
         let fill = if no_keepalive { 1 } else { pipeline };
         for _ in 0..fill {
             if state.stop.load(Ordering::Relaxed) {
+                conn_retries = 0;
                 break;
             }
-            if let Some(n) = target_n {
-                let slot = state.requested.fetch_add(1, Ordering::Relaxed);
-                if slot >= n {
-                    quota_done = true;
-                    break;
+            if conn_retries > 0 {
+                conn_retries -= 1;
+                // slot already claimed — just resend
+            } else {
+                if let Some(n) = target_n {
+                    let slot = state.requested.fetch_add(1, Ordering::Relaxed);
+                    if slot >= n {
+                        quota_done = true;
+                        break;
+                    }
                 }
             }
             if writer.write_all(&req_bytes).await.is_err() {
@@ -506,19 +522,25 @@ async fn worker(
 
                     let connection_closing = info.connection_close || no_keepalive;
 
-                    // Refill one pipeline slot — only when the connection stays open.
-                    // When the server signals close we stop sending but continue
-                    // draining: per RFC 7230 the server must reply to all pipelined
-                    // requests that arrived before the close decision.
-                    if !connection_closing && !quota_done && !state.stop.load(Ordering::Relaxed) {
-                        let can_send = if let Some(n) = target_n {
+                    if connection_closing {
+                        // Server is closing after this response.  Any remaining
+                        // in-flight requests were dropped by the server (e.g. nginx
+                        // keepalive_requests limit).  Save them as retries so they
+                        // are re-sent on the next connection without claiming new
+                        // slots — this gives zero spurious failures.
+                        conn_retries += inflight.len();
+                        inflight.clear();
+                        continue 'outer; // reconnect immediately
+                    }
+
+                    // Refill one pipeline slot on a healthy connection
+                    if !quota_done && !state.stop.load(Ordering::Relaxed) {
+                        let can_send = if conn_retries > 0 {
+                            conn_retries -= 1;
+                            true // retry slot already claimed
+                        } else if let Some(n) = target_n {
                             let slot = state.requested.fetch_add(1, Ordering::Relaxed);
-                            if slot >= n {
-                                quota_done = true;
-                                false
-                            } else {
-                                true
-                            }
+                            if slot >= n { quota_done = true; false } else { true }
                         } else {
                             true
                         };
@@ -535,18 +557,12 @@ async fn worker(
                         }
                     }
 
-                    // Once all in-flight responses have been drained, decide whether
-                    // to reconnect (connection closing) or exit (quota satisfied).
                     if inflight.is_empty() {
-                        if connection_closing {
-                            continue 'outer; // reconnect for remaining requests
-                        } else {
-                            break 'outer;
-                        }
+                        break 'outer;
                     }
                 }
                 Ok(Err(_)) | Err(_) => {
-                    // Connection error or timeout
+                    // Genuine connection error / timeout — count as failures
                     failed += inflight.len() as u64;
                     state.failed.fetch_add(inflight.len() as u64, Ordering::Relaxed);
                     inflight.clear();
