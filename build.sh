@@ -12,8 +12,11 @@ case "$ARCH" in
     *)       DEB_ARCH="$ARCH" ;;
 esac
 
-echo "building $VERSION for $ARCH"
+echo "*** building $VERSION for $ARCH"
+cargo clippy --release
 cargo build --release
+
+echo "*** building DEB"
 
 # Clean up before starting
 rm -rf target/pkg
@@ -38,6 +41,8 @@ EOF
 
 dpkg-deb --build target/pkg/deb/reqs_${VERSION}_${DEB_ARCH}
 mv target/pkg/deb/reqs_${VERSION}_${DEB_ARCH}.deb .
+
+echo "*** building RPM"
 
 # RPM (using rpmbuild)
 RPM_ROOT=$PWD/target/pkg/rpm
@@ -79,4 +84,3 @@ rpmbuild -bb \
 find target/pkg/rpm/RPMS -name "*.rpm" -exec mv {} . \;
 
 echo "Artifacts generated: reqs_${VERSION}_${DEB_ARCH}.deb and reqs-${VERSION}-1.*.rpm"
-

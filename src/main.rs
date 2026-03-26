@@ -1,5 +1,7 @@
 /// reqs — blazing-fast HTTP/HTTPS benchmarking tool
 ///
+/// ANSI color support: auto-disabled when NO_COLOR is set or stdout is not a TTY.
+///
 /// Architecture: raw TCP (no hyper), pre-built request bytes, zero-copy body
 /// draining, per-worker HDR histograms, optional HTTP/1.1 pipelining.
 use clap::Parser;
@@ -87,6 +89,14 @@ struct Args {
     /// Skip TLS certificate verification (self-signed / internal CAs)
     #[arg(long)]
     insecure: bool,
+
+    /// Disable colored output
+    #[arg(long)]
+    no_color: bool,
+
+    /// Batch mode: suppress progress output and colors; only print final results (useful for scripting)
+    #[arg(long)]
+    batch: bool,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -613,6 +623,49 @@ async fn worker(cfg: WorkerConfig) -> WorkerResult {
     }
 }
 
+// ── Color palette ────────────────────────────────────────────────────────────
+
+struct Palette {
+    bold:    &'static str,
+    dim:     &'static str,
+    cyan:    &'static str,
+    green:   &'static str,
+    yellow:  &'static str,
+    red:     &'static str,
+    magenta: &'static str,
+    reset:   &'static str,
+}
+
+impl Palette {
+    fn colored() -> Self {
+        Self {
+            bold:    "\x1b[1m",
+            dim:     "\x1b[2m",
+            cyan:    "\x1b[96m",
+            green:   "\x1b[92m",
+            yellow:  "\x1b[93m",
+            red:     "\x1b[91m",
+            magenta: "\x1b[95m",
+            reset:   "\x1b[0m",
+        }
+    }
+    fn plain() -> Self {
+        Self { bold: "", dim: "", cyan: "", green: "", yellow: "", red: "", magenta: "", reset: "" }
+    }
+    fn detect(force_off: bool) -> Self {
+        if force_off || std::env::var_os("NO_COLOR").is_some() || !isatty_stdout() {
+            Self::plain()
+        } else {
+            Self::colored()
+        }
+    }
+}
+
+fn isatty_stdout() -> bool {
+    // SAFETY: fileno is always valid, isatty is a pure query with no side effects.
+    unsafe { libc::isatty(libc::STDOUT_FILENO) != 0 }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn contains_crlf(s: &str) -> bool {
@@ -784,6 +837,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let no_keepalive  = args.no_keepalive;
     let insecure      = args.insecure;
     let percentiles_str = args.percentiles.clone();
+    let batch = args.batch;
+    let palette = Palette::detect(args.no_color || batch);
 
     // Build TLS connector once (shared across all workers)
     let tls_connector: Option<Arc<TlsConnector>> = if is_https {
@@ -824,15 +879,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = Arc::new(SharedState::default());
         let start = Instant::now();
 
-        println!(
-            "Running {} with {} connections ({} thread(s), pipeline={})",
-            match test_dur {
-                Some(d) => format!("for {:.1}s", d.as_secs_f64()),
-                None    => format!("{} requests", target_n.unwrap()),
-            },
-            connections, threads, pipeline
-        );
-        println!("Target: {}\n", args.url);
+        if !batch {
+            println!(
+                "{bold}Running {cyan}{}{reset}{bold} with {cyan}{}{reset}{bold} connections ({} thread(s), pipeline={}){reset}",
+                match test_dur {
+                    Some(d) => format!("for {:.1}s", d.as_secs_f64()),
+                    None    => format!("{} requests", target_n.unwrap()),
+                },
+                connections, threads, pipeline,
+                bold = palette.bold, cyan = palette.cyan, reset = palette.reset,
+            );
+            println!("{dim}Target: {}{reset}\n", args.url, dim = palette.dim, reset = palette.reset);
+        }
 
         // Spawn worker tasks
         let mut handles = Vec::with_capacity(connections);
@@ -850,6 +908,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })));
         }
 
+        // Ctrl+C handler — sets stop flag so workers drain and results are printed
+        let state_ctrlc = Arc::clone(&state);
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            state_ctrlc.stop.store(true, Ordering::Relaxed);
+        });
+
         // Progress reporter + duration-based stop signal
         let state2 = Arc::clone(&state);
         let prog = tokio::spawn(async move {
@@ -863,10 +928,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let failed = state2.failed.load(Ordering::Relaxed);
                 let rps    = done.saturating_sub(last_done);
                 last_done  = done;
-                eprint!(
-                    "\r{:>4}s  {:>10} req/s  {:>10} done  {:>8} failed",
-                    tick, rps, done, failed
-                );
+                if !batch {
+                    eprint!(
+                        "\r{dim}{:>4}s{reset}  {cyan}{:>10} req/s{reset}  {green}{:>10} done{reset}  {yellow}{:>8} failed{reset}",
+                        tick, rps, done, failed,
+                        dim = palette.dim, cyan = palette.cyan,
+                        green = palette.green, yellow = palette.yellow, reset = palette.reset,
+                    );
+                }
+                if state2.stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Some(dur) = test_dur {
                     if start.elapsed() >= dur {
                         state2.stop.store(true, Ordering::Relaxed);
@@ -889,7 +961,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         prog.abort();
         let elapsed = start.elapsed();
-        eprint!("\r{:<72}\r", ""); // clear progress line
+        if !batch {
+            eprint!("\r{:<72}\r", ""); // clear progress line
+        }
 
         // Merge per-worker results
         let mut total_done   = 0u64;
@@ -915,52 +989,101 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tput = total_bytes as f64 / secs;
 
         // ── Report ────────────────────────────────────────────────────────
-        let sep = "─".repeat(52);
+        let sep = format!("{dim}{}{reset}", "─".repeat(52), dim = palette.dim, reset = palette.reset);
+        let b  = palette.bold;
+        let c  = palette.cyan;
+        let g  = palette.green;
+        let r  = palette.red;
+        let mg = palette.magenta;
+        let rs = palette.reset;
         println!("{sep}");
-        println!("  reqs results");
+        println!("  {b}reqs results{rs}");
         println!("{sep}");
-        println!("  Target:     {}", args.url);
-        println!("  Duration:   {:.3}s", secs);
-        println!("  Threads:    {}  |  Connections: {}  |  Pipeline: {}", threads, connections, pipeline);
+        println!("  {b}Target:{rs}     {c}{}{rs}", args.url);
+        println!("  {b}Duration:{rs}   {:.3}s", secs);
+        println!("  {b}Threads:{rs}    {}  |  {b}Connections:{rs} {}  |  {b}Pipeline:{rs} {}", threads, connections, pipeline);
         println!("{sep}");
-        println!("  Requests:   {}", total_done + total_failed);
-        println!("  Completed:  {total_done}");
-        println!(
-            "  Failed:     {} ({:.2}%)",
-            total_failed,
-            if total_done + total_failed > 0 {
-                100.0 * total_failed as f64 / (total_done + total_failed) as f64
-            } else { 0.0 }
-        );
-        println!("  Req/s:      {rps:.2}");
-        println!("  Data recv:  {}", fmt_bytes(total_bytes));
-        println!("  Throughput: {}/s", fmt_bytes(tput as u64));
+        println!("  {b}Requests:{rs}   {}", total_done + total_failed);
+        println!("  {b}Completed:{rs}  {g}{total_done}{rs}");
+        let fail_pct = if total_done + total_failed > 0 {
+            100.0 * total_failed as f64 / (total_done + total_failed) as f64
+        } else { 0.0 };
+        let fail_color = if total_failed > 0 { r } else { g };
+        println!("  {b}Failed:{rs}     {fail_color}{} ({:.2}%){rs}", total_failed, fail_pct);
+        println!("  {b}Req/s:{rs}      {mg}{rps:.2}{rs}");
+        println!("  {b}Data recv:{rs}  {}", fmt_bytes(total_bytes));
+        println!("  {b}Throughput:{rs} {}/s", fmt_bytes(tput as u64));
 
         if !hist.is_empty() {
+            // ── Latency (horizontal) ─────────────────────────────────
+            let lat_cols: &[(&str, String)] = &[
+                ("Min",   fmt_us(hist.min())),
+                ("Avg",   fmt_us(hist.mean() as u64)),
+                ("Max",   fmt_us(hist.max())),
+                ("Stdev", fmt_us(hist.stdev() as u64)),
+            ];
+            // Column width = max(label len, value len) + 2 padding
+            let lat_widths: Vec<usize> = lat_cols
+                .iter()
+                .map(|(lbl, val)| lbl.len().max(val.len()) + 2)
+                .collect();
+
             println!("{sep}");
-            println!("  Latency:");
-            println!("    Min    {}", fmt_us(hist.min()));
-            println!("    Avg    {}", fmt_us(hist.mean() as u64));
-            println!("    Max    {}", fmt_us(hist.max()));
-            println!("    Stdev  {}", fmt_us(hist.stdev() as u64));
+            // Header row
+            print!("  {b}Latency{rs}  ");
+            for ((lbl, _), w) in lat_cols.iter().zip(&lat_widths) {
+                print!("  {b}{:^w$}{rs}", lbl, w = w);
+            }
             println!();
-            println!("  Percentiles:");
-            for p in percentiles_str
+            // Value row
+            print!("             ");
+            for ((_, val), w) in lat_cols.iter().zip(&lat_widths) {
+                print!("  {c}{:^w$}{rs}", val, w = w, c = c, rs = rs);
+            }
+            println!();
+
+            // ── Percentiles (horizontal) ─────────────────────────────
+            let pct_cols: Vec<(String, String)> = percentiles_str
                 .split(',')
                 .filter_map(|s| s.trim().parse::<f64>().ok())
-            {
-                let val = hist.value_at_quantile(p / 100.0);
-                println!("    p{:<7}  {}", p, fmt_us(val));
+                .map(|p| (format!("p{p}"), fmt_us(hist.value_at_quantile(p / 100.0))))
+                .collect();
+
+            if !pct_cols.is_empty() {
+                let pct_widths: Vec<usize> = pct_cols
+                    .iter()
+                    .map(|(lbl, val)| lbl.len().max(val.len()) + 2)
+                    .collect();
+
+                println!("{sep}");
+                // Header row
+                print!("  {b}Percentiles{rs}");
+                for ((lbl, _), w) in pct_cols.iter().zip(&pct_widths) {
+                    print!("  {b}{:^w$}{rs}", lbl, w = w);
+                }
+                println!();
+                // Value row
+                print!("               ");
+                for ((_, val), w) in pct_cols.iter().zip(&pct_widths) {
+                    print!("  {c}{:^w$}{rs}", val, w = w, c = c, rs = rs);
+                }
+                println!();
             }
         }
 
         if collect_status && !status_map.is_empty() {
             println!("{sep}");
-            println!("  HTTP Status Codes:");
+            println!("  {b}HTTP Status Codes:{rs}");
             let mut codes: Vec<_> = status_map.iter().collect();
             codes.sort_by_key(|(k, _)| *k);
             for (code, cnt) in codes {
-                println!("    [{code}]  {cnt}");
+                let code_color = match code / 100 {
+                    2 => g,
+                    3 => c,
+                    4 | 5 => r,
+                    _ => b,
+                };
+                println!("    {code_color}[{code}]{rs}  {cnt}");
             }
         }
 

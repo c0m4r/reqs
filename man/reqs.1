@@ -1,4 +1,4 @@
-.TH REQS 1 "2026-03-26" "reqs 0.1.0" "User Commands"
+.TH REQS 1 "2026-03-27" "reqs 0.2.0" "User Commands"
 .SH NAME
 reqs \- blazing-fast HTTP/HTTPS benchmarking tool
 .SH SYNOPSIS
@@ -43,6 +43,13 @@ HTTP/1.1 pipeline depth — requests in-flight per connection (default: 1).
 .TP
 .BI \-\-insecure"
 Skip TLS certificate verification (self-signed / internal CAs).
+.TP
+.BI \-\-no\-color"
+Disable colored output.
+.TP
+.BI \-\-batch"
+Batch mode: suppress progress output and colors; only print final results.
+Intended for use in scripts that parse benchmark output.
 .SH EXAMPLES
 .TP
 .B reqs -c 100 -d 30s https://example.com
