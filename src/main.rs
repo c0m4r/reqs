@@ -4,8 +4,9 @@
 /// draining, per-worker HDR histograms, optional HTTP/1.1 pipelining.
 use clap::Parser;
 use hdrhistogram::Histogram;
-use rustls::ClientConfig;
-use rustls_pki_types::ServerName;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -81,6 +82,10 @@ struct Args {
     /// HTTP/1.1 pipeline depth — requests in-flight per connection
     #[arg(short = 'p', long, default_value = "1")]
     pipeline: usize,
+
+    /// Skip TLS certificate verification (self-signed / internal CAs)
+    #[arg(long)]
+    insecure: bool,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -171,6 +176,58 @@ impl AsyncWrite for AnyStream {
             Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
             Self::Tls(s)   => Pin::new(s).poll_shutdown(cx),
         }
+    }
+}
+
+// ── TLS certificate verifier (--insecure) ─────────────────────────────────────
+
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer,
+        _intermediates: &[CertificateDer],
+        _server_name: &ServerName,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -350,6 +407,14 @@ async fn worker(
         let stream = match tcp_connect(&target, tls.as_deref()).await {
             Ok(s) => s,
             Err(_) => {
+                // In -n mode consume one slot so we make progress toward the
+                // limit even when every connection attempt fails.
+                if let Some(n) = target_n {
+                    let slot = state.requested.fetch_add(1, Ordering::Relaxed);
+                    if slot >= n {
+                        break 'outer;
+                    }
+                }
                 failed += 1;
                 state.failed.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -439,17 +504,13 @@ async fn worker(
                         *statuses.entry(info.status).or_insert(0) += 1;
                     }
 
-                    // If server wants to close, bail out after all pending responses
-                    if info.connection_close || no_keepalive {
-                        // Fail remaining in-flight (they won't be served on this conn)
-                        failed += inflight.len() as u64;
-                        state.failed.fetch_add(inflight.len() as u64, Ordering::Relaxed);
-                        inflight.clear();
-                        continue 'outer;
-                    }
+                    let connection_closing = info.connection_close || no_keepalive;
 
-                    // Refill one pipeline slot
-                    if !quota_done && !state.stop.load(Ordering::Relaxed) {
+                    // Refill one pipeline slot — only when the connection stays open.
+                    // When the server signals close we stop sending but continue
+                    // draining: per RFC 7230 the server must reply to all pipelined
+                    // requests that arrived before the close decision.
+                    if !connection_closing && !quota_done && !state.stop.load(Ordering::Relaxed) {
                         let can_send = if let Some(n) = target_n {
                             let slot = state.requested.fetch_add(1, Ordering::Relaxed);
                             if slot >= n {
@@ -474,9 +535,14 @@ async fn worker(
                         }
                     }
 
-                    // All in-flight drained and no more to send — exit cleanly
+                    // Once all in-flight responses have been drained, decide whether
+                    // to reconnect (connection closing) or exit (quota satisfied).
                     if inflight.is_empty() {
-                        break 'outer;
+                        if connection_closing {
+                            continue 'outer; // reconnect for remaining requests
+                        } else {
+                            break 'outer;
+                        }
                     }
                 }
                 Ok(Err(_)) | Err(_) => {
@@ -501,11 +567,28 @@ async fn worker(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn parse_headers(raw: &[String]) -> Vec<(String, String)> {
+fn contains_crlf(s: &str) -> bool {
+    s.contains('\r') || s.contains('\n')
+}
+
+fn parse_headers(raw: &[String]) -> Result<Vec<(String, String)>, String> {
     raw.iter()
-        .filter_map(|h| {
-            let (k, v) = h.split_once(':')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
+        .map(|h| {
+            let (k, v) = h
+                .split_once(':')
+                .ok_or_else(|| format!("header missing ':' — {h:?}"))?;
+            let name  = k.trim();
+            let value = v.trim();
+            if name.is_empty() {
+                return Err(format!("empty header name in {h:?}"));
+            }
+            if contains_crlf(name) {
+                return Err(format!("header name contains CR or LF: {name:?}"));
+            }
+            if contains_crlf(value) {
+                return Err(format!("header value contains CR or LF: {value:?}"));
+            }
+            Ok((name.to_string(), value.to_string()))
         })
         .collect()
 }
@@ -516,7 +599,17 @@ fn build_request(
     host: &str,
     extra: &[(String, String)],
     keepalive: bool,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, String> {
+    // Reject CR/LF in request-line components — they would corrupt the framing.
+    if method.is_empty() || method.contains(['\r', '\n', ' ']) {
+        return Err(format!("invalid HTTP method: {method:?}"));
+    }
+    if contains_crlf(path) {
+        return Err(format!("path contains CR or LF: {path:?}"));
+    }
+    if contains_crlf(host) {
+        return Err(format!("host contains CR or LF: {host:?}"));
+    }
     let mut r = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
     for (k, v) in extra {
         r.push_str(k);
@@ -528,7 +621,7 @@ fn build_request(
         r.push_str("Connection: close\r\n");
     }
     r.push_str("\r\n");
-    r.into_bytes()
+    Ok(r.into_bytes())
 }
 
 fn fmt_bytes(b: u64) -> String {
@@ -565,14 +658,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse URL
     let url = &args.url;
     let (scheme, rest) = url.split_once("://").ok_or("URL missing ://")?;
-    let is_https = scheme.eq_ignore_ascii_case("https");
+    let is_https = match scheme.to_ascii_lowercase().as_str() {
+        "https" => true,
+        "http"  => false,
+        other   => return Err(format!("unsupported scheme '{other}'; only http and https are supported").into()),
+    };
     let (host_port, path_str) = rest.split_once('/').unwrap_or((rest, ""));
     let path = format!("/{path_str}");
-    let (host, port_str) = host_port.split_once(':').unwrap_or((
-        host_port,
-        if is_https { "443" } else { "80" },
-    ));
-    let port: u16 = port_str.parse()?;
+
+    // Parse host and port with IPv6 literal support ([::1]:8080)
+    let (host, port): (&str, u16) = if host_port.starts_with('[') {
+        let end = host_port
+            .find(']')
+            .ok_or("IPv6 address missing closing ']'")?;
+        let h = &host_port[1..end];
+        let rest_after = &host_port[end + 1..];
+        let p: u16 = if let Some(port_str) = rest_after.strip_prefix(':') {
+            port_str.parse().map_err(|_| "invalid port in URL")?
+        } else if rest_after.is_empty() {
+            if is_https { 443 } else { 80 }
+        } else {
+            return Err(format!("unexpected characters after IPv6 address: {rest_after:?}").into());
+        };
+        (h, p)
+    } else {
+        match host_port.split_once(':') {
+            Some((h, p)) => (h, p.parse().map_err(|_| "invalid port in URL")?),
+            None => (host_port, if is_https { 443 } else { 80 }),
+        }
+    };
 
     // Blocking DNS resolution (done once before the benchmark)
     let addr = format!("{host}:{port}")
@@ -587,14 +701,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path,
     });
 
-    let extra_headers = parse_headers(&args.headers);
-    let req_bytes = Arc::new(build_request(
-        &args.method,
-        &target.path,
-        &format!("{}:{}", target.host, port),
-        &extra_headers,
-        !args.no_keepalive,
-    ));
+    let extra_headers = parse_headers(&args.headers)
+        .map_err(|e| format!("invalid header: {e}"))?;
+    let req_bytes = Arc::new(
+        build_request(
+            &args.method,
+            &target.path,
+            &format!("{}:{}", target.host, port),
+            &extra_headers,
+            !args.no_keepalive,
+        )
+        .map_err(|e| format!("invalid request: {e}"))?,
+    );
 
     let threads = args.threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
@@ -607,15 +725,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target_n      = args.requests;
     let collect_status = args.status_codes;
     let no_keepalive  = args.no_keepalive;
+    let insecure      = args.insecure;
     let percentiles_str = args.percentiles.clone();
 
     // Build TLS connector once (shared across all workers)
     let tls_connector: Option<Arc<TlsConnector>> = if is_https {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let cfg = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let base = ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("TLS protocol config error: {e}"))?;
+        let cfg = if insecure {
+            base.dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+                .with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            base.with_root_certificates(roots).with_no_client_auth()
+        };
         Some(Arc::new(TlsConnector::from(Arc::new(cfg))))
     } else {
         None
@@ -628,6 +755,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     rt.block_on(async move {
+        // ── Pre-flight connectivity check ─────────────────────────────────
+        if let Err(e) = tcp_connect(&target, tls_connector.as_deref()).await {
+            eprintln!("error: cannot connect to {}: {e}", args.url);
+            if is_https && !insecure {
+                eprintln!("hint:  for self-signed or internal certificates, add --insecure");
+            }
+            return Ok(());
+        }
+
         let state = Arc::new(SharedState::default());
         let start = Instant::now();
 
