@@ -1,0 +1,57 @@
+.TH REQS 1 "2026-03-26" "reqs 0.1.0" "User Commands"
+.SH NAME
+reqs \- blazing-fast HTTP/HTTPS benchmarking tool
+.SH SYNOPSIS
+.B reqs
+[\fIOPTIONS\fR] \fIURL\fR
+.SH DESCRIPTION
+\fBreqs\fR is a high-performance HTTP/HTTPS load testing tool written in Rust. It uses raw TCP for minimal overhead, pre-built request bytes, and zero-copy body draining.
+.SH OPTIONS
+.TP
+.BI \-c ", \-\-connections " <CONNECTIONS>
+Number of concurrent connections (default: 10).
+.TP
+.BI \-d ", \-\-duration " <DURATION>
+Test duration (e.g. 10s, 1m30s). Conflicts with -n.
+.TP
+.BI \-n ", \-\-requests " <REQUESTS>
+Total requests to send. Conflicts with -d.
+.TP
+.BI \-t ", \-\-threads " <THREADS>
+OS worker threads (default: CPU count).
+.TP
+.BI \-\-timeout " <TIMEOUT>
+Request timeout in seconds (default: 30).
+.TP
+.BI \-H ", \-\-header " <HEADER>
+Request header, repeatable (e.g. -H "Accept: application/json").
+.TP
+.BI \-X ", \-\-method " <METHOD>
+HTTP method (default: GET).
+.TP
+.BI \-s ", \-\-status\-codes"
+Show HTTP status code breakdown in results.
+.TP
+.BI \-\-percentiles " <PERCENTILES>
+Latency percentiles to display (comma-separated, default: 50,75,90,95,99,99.9).
+.TP
+.BI \-\-no\-keepalive"
+Disable keep-alive (reconnect after each request).
+.TP
+.BI \-p ", \-\-pipeline " <PIPELINE>
+HTTP/1.1 pipeline depth — requests in-flight per connection (default: 1).
+.TP
+.BI \-\-insecure"
+Skip TLS certificate verification (self-signed / internal CAs).
+.SH EXAMPLES
+.TP
+.B reqs -c 100 -d 30s https://example.com
+Benchmarking with 100 connections for 30 seconds.
+.TP
+.B reqs -c 50 -n 10000 -t 4 http://localhost:8080
+Benchmarking with 10000 requests using 4 threads.
+.TP
+.B reqs -c 10 -d 10s -p 16 http://localhost:8080
+Benchmarking with HTTP/1.1 pipelining (depth 16).
+.SH AUTHOR
+Initial version by c0m4r.

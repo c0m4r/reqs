@@ -29,7 +29,8 @@ use tokio_rustls::TlsConnector;
     name = "reqs",
     about = "Blazing fast HTTP/HTTPS benchmarking tool",
     version,
-    long_about = "High-performance HTTP/HTTPS load testing tool.\n\
+    long_about = "High-performance HTTP/HTTPS load testing tool.\
+        \nhttps://github.com/c0m4r/reqs\n\
         \nExamples:\
         \n  reqs -c 100 -d 30s https://example.com\
         \n  reqs -c 50 -n 10000 -t 4 http://localhost:8080\
