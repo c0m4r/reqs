@@ -39,8 +39,34 @@ Target: http://localhost/status
 
 <img width="730" height="248" alt="image" src="https://github.com/user-attachments/assets/0f5b3712-aefb-4325-8543-bdc0951b2ed9" />
 
+## Install
 
-## Build from source
+### Standalone
+
+```bash
+wget https://github.com/c0m4r/reqs/releases/download/0.1.0/reqs-0.1.0-1.x86_64
+echo "40d3a68ba83b0cdcc57171b9a8803a40ff51adf0ffd17799154607333a4988c3 reqs" | sha256sum -c || rm -f reqs-0.1.0-1.x86_64
+chmod +x reqs-0.1.0-1.x86_64
+sudo mv reqs-0.1.0-1.x86_64 /usr/local/bin/reqs
+```
+
+### Debian / Ubuntu
+
+```bash
+wget https://github.com/c0m4r/reqs/releases/download/0.1.0/reqs_0.1.0_amd64.deb
+echo "fbfe81bc02b9335eea98229d6d8167923e005922e89145740942b6bde741a996 reqs_0.1.0_amd64.deb" | sha256sum -c || rm -f reqs_0.1.0_amd64.deb
+sudo dpkg -i reqs_0.1.0_amd64.deb
+```
+
+### Red Hat / Fedora / CentOS / Rocky / Alma
+
+```bash
+wget https://github.com/c0m4r/reqs/releases/download/0.1.0/reqs-0.1.0-1.x86_64.rpm
+echo "0c5d527369ce5e6729167ec3c57550e5049a57935ffb5cdb3736bf3e1974ed48 reqs-0.1.0-1.x86_64.rpm" | sha256sum -c || rm -f reqs-0.1.0-1.x86_64.rpm
+sudo dnf  install reqs-0.1.0-1.x86_64.rpm
+```
+
+### Build from source
 
 ```bash
 git clone https://github.com/c0m4r/reqs.git
@@ -49,16 +75,22 @@ cargo build --release
 ./target/release/reqs --help
 ```
 
-## Examples
+## How to use
 
 Run test for x seconds to check how muh req/s your server can handle
 
 ```bash
-./target/release/reqs -c 2 -d 5s -t 2 http://localhost/status
+reqs -c 2 -d 5s -t 2 http://localhost/status
 ```
 
 Run test until you reach given number of requests:
 
 ```bash
-./target/release/reqs -n 100 http://localhost/status
+reqs -n 100 http://localhost/status
+```
+
+Usage:
+
+```bash
+reqs --help
 ```
