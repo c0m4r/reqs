@@ -260,15 +260,30 @@ async fn read_response_headers<R: AsyncBufRead + Unpin>(
             "EOF on status line",
         ));
     }
+    // Minimum valid status line: "HTTP/1.x NNN" = 12 bytes
     if line.len() < 12 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "short status line",
         ));
     }
-    let status = (line[9]  - b'0') as u16 * 100
-               + (line[10] - b'0') as u16 * 10
-               + (line[11] - b'0') as u16;
+    // Verify HTTP/1.x prefix before trusting any fixed offsets
+    if !line.starts_with(b"HTTP/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response does not start with HTTP/",
+        ));
+    }
+    let (d0, d1, d2) = (line[9], line[10], line[11]);
+    if !d0.is_ascii_digit() || !d1.is_ascii_digit() || !d2.is_ascii_digit() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-numeric status code",
+        ));
+    }
+    let status = (d0 - b'0') as u16 * 100
+               + (d1 - b'0') as u16 * 10
+               + (d2 - b'0') as u16;
 
     let mut content_length:   Option<u64> = None;
     let mut is_chunked        = false;
@@ -683,7 +698,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("/{path_str}");
 
     // Parse host and port with IPv6 literal support ([::1]:8080)
-    let (host, port): (&str, u16) = if host_port.starts_with('[') {
+    let is_ipv6_literal = host_port.starts_with('[');
+    let (host, port): (&str, u16) = if is_ipv6_literal {
         let end = host_port
             .find(']')
             .ok_or("IPv6 address missing closing ']'")?;
@@ -704,8 +720,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Blocking DNS resolution (done once before the benchmark)
-    let addr = format!("{host}:{port}")
+    // Use the tuple form of to_socket_addrs so IPv6 bare addresses are
+    // passed correctly without any manual bracket/colon formatting.
+    let addr = (host, port)
         .to_socket_addrs()?
         .next()
         .ok_or("DNS resolution failed")?;
@@ -717,13 +734,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path,
     });
 
+    // RFC 7230 §5.4: IPv6 literals in the Host header must be bracketed.
+    let host_header = if is_ipv6_literal {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+
     let extra_headers = parse_headers(&args.headers)
         .map_err(|e| format!("invalid header: {e}"))?;
     let req_bytes = Arc::new(
         build_request(
             &args.method,
             &target.path,
-            &format!("{}:{}", target.host, port),
+            &host_header,
             &extra_headers,
             !args.no_keepalive,
         )
