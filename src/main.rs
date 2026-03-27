@@ -627,12 +627,13 @@ async fn worker(cfg: WorkerConfig) -> WorkerResult {
 
 struct Palette {
     bold:    &'static str,
-    dim:     &'static str,
-    cyan:    &'static str,
-    green:   &'static str,
-    yellow:  &'static str,
-    red:     &'static str,
-    magenta: &'static str,
+    dim:     &'static str,  // charcoal — separators, secondary text
+    accent:  &'static str,  // violet   — tool name, section titles
+    cyan:    &'static str,  // lavender — metric values, URLs, percentiles
+    green:   &'static str,  // mint     — success / completed
+    yellow:  &'static str,  // amber    — req/s, warnings in progress
+    red:     &'static str,  // coral    — errors, failures
+    magenta: &'static str,  // gold     — throughput highlight
     reset:   &'static str,
 }
 
@@ -640,17 +641,18 @@ impl Palette {
     fn colored() -> Self {
         Self {
             bold:    "\x1b[1m",
-            dim:     "\x1b[2m",
-            cyan:    "\x1b[96m",
-            green:   "\x1b[92m",
-            yellow:  "\x1b[93m",
-            red:     "\x1b[91m",
-            magenta: "\x1b[95m",
+            dim:     "\x1b[38;5;240m",   // charcoal gray
+            accent:  "\x1b[38;5;141m",   // soft violet
+            cyan:    "\x1b[38;5;147m",   // lavender
+            green:   "\x1b[38;5;114m",   // mint green
+            yellow:  "\x1b[38;5;222m",   // warm amber
+            red:     "\x1b[38;5;210m",   // coral / salmon
+            magenta: "\x1b[38;5;214m",   // orange-gold
             reset:   "\x1b[0m",
         }
     }
     fn plain() -> Self {
-        Self { bold: "", dim: "", cyan: "", green: "", yellow: "", red: "", magenta: "", reset: "" }
+        Self { bold: "", dim: "", accent: "", cyan: "", green: "", yellow: "", red: "", magenta: "", reset: "" }
     }
     fn detect(force_off: bool) -> Self {
         if force_off || std::env::var_os("NO_COLOR").is_some() || !isatty_stdout() {
@@ -880,16 +882,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
 
         if !batch {
+            let mode_str = match test_dur {
+                Some(d) => format!("for {:.1}s", d.as_secs_f64()),
+                None    => format!("{} requests", target_n.unwrap()),
+            };
             println!(
-                "{bold}Running {cyan}{}{reset}{bold} with {cyan}{}{reset}{bold} connections ({} thread(s), pipeline={}){reset}",
-                match test_dur {
-                    Some(d) => format!("for {:.1}s", d.as_secs_f64()),
-                    None    => format!("{} requests", target_n.unwrap()),
-                },
-                connections, threads, pipeline,
-                bold = palette.bold, cyan = palette.cyan, reset = palette.reset,
+                "{dim}╺╸{reset} {accent}{bold}reqs{reset}  {dim}{mode_str}{reset}  {dim}·{reset}  {cyan}{connections}{reset} conn  {dim}·{reset}  {cyan}{threads}{reset} thread(s)  {dim}·{reset}  pipeline {cyan}{pipeline}{reset}",
+                dim = palette.dim, reset = palette.reset, accent = palette.accent,
+                bold = palette.bold, cyan = palette.cyan,
             );
-            println!("{dim}Target: {}{reset}\n", args.url, dim = palette.dim, reset = palette.reset);
+            println!("{dim}  ↪{reset}  {}",  args.url, dim = palette.dim, reset = palette.reset);
+            println!();
         }
 
         // Spawn worker tasks
@@ -930,10 +933,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_done  = done;
                 if !batch {
                     eprint!(
-                        "\r{dim}{:>4}s{reset}  {cyan}{:>10} req/s{reset}  {green}{:>10} done{reset}  {yellow}{:>8} failed{reset}",
+                        "\r  {dim}▪{reset} {yellow}{:>4}s{reset}  {dim}·{reset}  {magenta}{:>10} req/s{reset}  {dim}·{reset}  {green}{:>9} done{reset}  {dim}·{reset}  {red}{:>7} failed{reset}",
                         tick, rps, done, failed,
-                        dim = palette.dim, cyan = palette.cyan,
-                        green = palette.green, yellow = palette.yellow, reset = palette.reset,
+                        dim = palette.dim, yellow = palette.yellow, magenta = palette.magenta,
+                        green = palette.green, red = palette.red, reset = palette.reset,
                     );
                 }
                 if state2.stop.load(Ordering::Relaxed) {
@@ -989,30 +992,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tput = total_bytes as f64 / secs;
 
         // ── Report ────────────────────────────────────────────────────────
-        let sep = format!("{dim}{}{reset}", "─".repeat(52), dim = palette.dim, reset = palette.reset);
-        let b  = palette.bold;
-        let c  = palette.cyan;
-        let g  = palette.green;
-        let r  = palette.red;
-        let mg = palette.magenta;
-        let rs = palette.reset;
+        let sep = format!("{dim}{}{reset}", "━".repeat(52), dim = palette.dim, reset = palette.reset);
+        let b   = palette.bold;
+        let c   = palette.cyan;
+        let g   = palette.green;
+        let r   = palette.red;
+        let mg  = palette.magenta;
+        let ac  = palette.accent;
+        let rs  = palette.reset;
         println!("{sep}");
-        println!("  {b}reqs results{rs}");
+        println!("  {ac}{b}◆ reqs{rs}  {dim}v{}{rs}", env!("CARGO_PKG_VERSION"), dim = palette.dim);
         println!("{sep}");
-        println!("  {b}Target:{rs}     {c}{}{rs}", args.url);
-        println!("  {b}Duration:{rs}   {:.3}s", secs);
-        println!("  {b}Threads:{rs}    {}  |  {b}Connections:{rs} {}  |  {b}Pipeline:{rs} {}", threads, connections, pipeline);
+        println!("  {b}Target    {rs} {c}{}{rs}", args.url);
+        println!("  {b}Duration  {rs} {:.3}s", secs);
+        println!("  {b}Threads   {rs} {}  {dim}·{rs}  {b}Connections{rs} {}  {dim}·{rs}  {b}Pipeline{rs} {}",
+            threads, connections, pipeline, dim = palette.dim);
         println!("{sep}");
-        println!("  {b}Requests:{rs}   {}", total_done + total_failed);
-        println!("  {b}Completed:{rs}  {g}{total_done}{rs}");
+        println!("  {b}Requests  {rs} {}", total_done + total_failed);
+        println!("  {b}Completed {rs} {g}{total_done}{rs}");
         let fail_pct = if total_done + total_failed > 0 {
             100.0 * total_failed as f64 / (total_done + total_failed) as f64
         } else { 0.0 };
         let fail_color = if total_failed > 0 { r } else { g };
-        println!("  {b}Failed:{rs}     {fail_color}{} ({:.2}%){rs}", total_failed, fail_pct);
-        println!("  {b}Req/s:{rs}      {mg}{rps:.2}{rs}");
-        println!("  {b}Data recv:{rs}  {}", fmt_bytes(total_bytes));
-        println!("  {b}Throughput:{rs} {}/s", fmt_bytes(tput as u64));
+        println!("  {b}Failed    {rs} {fail_color}{} ({:.2}%){rs}", total_failed, fail_pct);
+        println!("  {b}Req/s     {rs} {mg}{rps:.2}{rs}");
+        println!("  {b}Data recv {rs} {}", fmt_bytes(total_bytes));
+        println!("  {b}Throughput{rs} {mg}{}/s{rs}", fmt_bytes(tput as u64));
 
         if !hist.is_empty() {
             // ── Latency (horizontal) ─────────────────────────────────
@@ -1030,13 +1035,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("{sep}");
             // Header row
-            print!("  {b}Latency{rs}  ");
+            print!("  {ac}{b}Latency{rs}   ");
             for ((lbl, _), w) in lat_cols.iter().zip(&lat_widths) {
                 print!("  {b}{:^w$}{rs}", lbl, w = w);
             }
             println!();
             // Value row
-            print!("             ");
+            print!("              ");
             for ((_, val), w) in lat_cols.iter().zip(&lat_widths) {
                 print!("  {c}{:^w$}{rs}", val, w = w, c = c, rs = rs);
             }
@@ -1057,7 +1062,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 println!("{sep}");
                 // Header row
-                print!("  {b}Percentiles{rs}");
+                print!("  {ac}{b}Percentiles{rs}");
                 for ((lbl, _), w) in pct_cols.iter().zip(&pct_widths) {
                     print!("  {b}{:^w$}{rs}", lbl, w = w);
                 }
@@ -1073,7 +1078,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if collect_status && !status_map.is_empty() {
             println!("{sep}");
-            println!("  {b}HTTP Status Codes:{rs}");
+            println!("  {ac}{b}Status Codes{rs}");
             let mut codes: Vec<_> = status_map.iter().collect();
             codes.sort_by_key(|(k, _)| *k);
             for (code, cnt) in codes {
@@ -1083,7 +1088,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     4 | 5 => r,
                     _ => b,
                 };
-                println!("    {code_color}[{code}]{rs}  {cnt}");
+                println!("  {dim}·{rs}  {code_color}{code}{rs}  {dim}┈┈{rs}  {cnt}",
+                    dim = palette.dim);
             }
         }
 
