@@ -280,11 +280,11 @@ async fn read_response_headers<R: AsyncBufRead + Unpin>(
             "EOF on status line",
         ));
     }
-    // Minimum valid status line: "HTTP/1.x NNN" = 12 bytes
-    if line.len() < 12 {
+    // Status line must be at least "HTTP/1.x NNN" (12 bytes) and byte 8 must be a space.
+    if line.len() < 12 || line[8] != b' ' {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "short status line",
+            "short or malformed status line",
         ));
     }
     // Verify HTTP/1.x prefix before trusting any fixed offsets
@@ -376,7 +376,12 @@ async fn drain_chunked<R: AsyncBufRead + Unpin>(
     let mut total = 0u64;
     loop {
         line.clear();
-        reader.read_until(b'\n', line).await?;
+        if reader.read_until(b'\n', line).await? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF reading chunk size",
+            ));
+        }
         let hex = std::str::from_utf8(line)
             .unwrap_or("")
             .trim()
@@ -442,9 +447,13 @@ async fn worker(cfg: WorkerConfig) -> WorkerResult {
 
     'outer: loop {
         if state.stop.load(Ordering::Relaxed) {
-            // stop is only set in duration mode (target_n is None),
-            // so conn_retries hold no claimed -n slots — safe to discard.
-            let _ = conn_retries;
+            // In -n mode, conn_retries holds slots already claimed from the shared
+            // counter. We are abandoning them here, so count them as failures so
+            // that external progress tracking stays accurate.
+            if conn_retries > 0 {
+                state.failed.fetch_add(conn_retries as u64, Ordering::Relaxed);
+                failed += conn_retries as u64;
+            }
             break;
         }
 
@@ -549,7 +558,9 @@ async fn worker(cfg: WorkerConfig) -> WorkerResult {
 
                     // Record latency for this request
                     let t0 = inflight.pop_front().unwrap();
-                    let us = t0.elapsed().as_micros() as u64;
+                    // Clamp to u64::MAX (≈584,542 years) to prevent overflow on
+                    // pathological/mock servers with extremely long response times.
+                    let us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
                     done  += 1;
                     bytes += body_len;
                     let _ = hist.record(us.max(1));
@@ -743,6 +754,17 @@ fn fmt_us(us: u64) -> String {
     else                    { format!("{us}µs") }
 }
 
+fn fmt_rps(rps: f64) -> String {
+    let rps_val = rps.round() as u64;
+    if rps >= 1_000_000.0 {
+        format!("{} ({:.0}m)", rps_val, rps / 1_000_000.0)
+    } else if rps >= 1_000.0 {
+        format!("{} ({:.0}k)", rps_val, rps / 1_000.0)
+    } else {
+        format!("{}", rps_val)
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -931,6 +953,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let failed = state2.failed.load(Ordering::Relaxed);
                 let rps    = done.saturating_sub(last_done);
                 last_done  = done;
+                if state2.stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 if !batch {
                     eprint!(
                         "\r  {dim}▪{reset} {yellow}{:>4}s{reset}  {dim}·{reset}  {magenta}{:>10} req/s{reset}  {dim}·{reset}  {green}{:>9} done{reset}  {dim}·{reset}  {red}{:>7} failed{reset}",
@@ -938,9 +963,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dim = palette.dim, yellow = palette.yellow, magenta = palette.magenta,
                         green = palette.green, red = palette.red, reset = palette.reset,
                     );
-                }
-                if state2.stop.load(Ordering::Relaxed) {
-                    break;
                 }
                 if let Some(dur) = test_dur {
                     if start.elapsed() >= dur {
@@ -992,7 +1014,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tput = total_bytes as f64 / secs;
 
         // ── Report ────────────────────────────────────────────────────────
-        let sep = format!("{dim}{}{reset}", "━".repeat(52), dim = palette.dim, reset = palette.reset);
+        let sep = format!("{dim}{}{reset}", "─".repeat(52), dim = palette.dim, reset = palette.reset);
         let b   = palette.bold;
         let c   = palette.cyan;
         let g   = palette.green;
@@ -1015,7 +1037,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else { 0.0 };
         let fail_color = if total_failed > 0 { r } else { g };
         println!("  {b}Failed    {rs} {fail_color}{} ({:.2}%){rs}", total_failed, fail_pct);
-        println!("  {b}Req/s     {rs} {mg}{rps:.2}{rs}");
+        println!("  {b}Req/s     {rs} {mg}{}{rs}", fmt_rps(rps));
         println!("  {b}Data recv {rs} {}", fmt_bytes(total_bytes));
         println!("  {b}Throughput{rs} {mg}{}/s{rs}", fmt_bytes(tput as u64));
 
@@ -1034,14 +1056,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
 
             println!("{sep}");
+            println!("  {ac}{b}Latency{rs}");
             // Header row
-            print!("  {ac}{b}Latency{rs}   ");
+            print!("    ");
             for ((lbl, _), w) in lat_cols.iter().zip(&lat_widths) {
                 print!("  {b}{:^w$}{rs}", lbl, w = w);
             }
             println!();
             // Value row
-            print!("              ");
+            print!("    ");
             for ((_, val), w) in lat_cols.iter().zip(&lat_widths) {
                 print!("  {c}{:^w$}{rs}", val, w = w, c = c, rs = rs);
             }
@@ -1061,14 +1084,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect();
 
                 println!("{sep}");
+                println!("  {ac}{b}Percentiles{rs}");
                 // Header row
-                print!("  {ac}{b}Percentiles{rs}");
+                print!("    ");
                 for ((lbl, _), w) in pct_cols.iter().zip(&pct_widths) {
                     print!("  {b}{:^w$}{rs}", lbl, w = w);
                 }
                 println!();
                 // Value row
-                print!("               ");
+                print!("    ");
                 for ((_, val), w) in pct_cols.iter().zip(&pct_widths) {
                     print!("  {c}{:^w$}{rs}", val, w = w, c = c, rs = rs);
                 }
