@@ -49,30 +49,9 @@ Target: http://localhost/status
 
 ## Install
 
-### Standalone
+https://github.com/c0m4r/reqs/releases
 
-```bash
-wget https://github.com/c0m4r/reqs/releases/download/0.1.0/reqs-0.1.0-1.x86_64 -O reqs
-echo "40d3a68ba83b0cdcc57171b9a8803a40ff51adf0ffd17799154607333a4988c3 reqs" | sha256sum -c || rm -f reqs
-chmod +x reqs
-sudo mv reqs /usr/local/bin/
-```
-
-### Debian / Ubuntu
-
-```bash
-wget https://github.com/c0m4r/reqs/releases/download/0.1.0/reqs_0.1.0_amd64.deb
-echo "fbfe81bc02b9335eea98229d6d8167923e005922e89145740942b6bde741a996 reqs_0.1.0_amd64.deb" | sha256sum -c || rm -f reqs_0.1.0_amd64.deb
-sudo dpkg -i reqs_0.1.0_amd64.deb
-```
-
-### Red Hat / Fedora / CentOS / Rocky / Alma
-
-```bash
-wget https://github.com/c0m4r/reqs/releases/download/0.1.0/reqs-0.1.0-1.x86_64.rpm
-echo "0c5d527369ce5e6729167ec3c57550e5049a57935ffb5cdb3736bf3e1974ed48 reqs-0.1.0-1.x86_64.rpm" | sha256sum -c || rm -f reqs-0.1.0-1.x86_64.rpm
-sudo dnf  install reqs-0.1.0-1.x86_64.rpm
-```
+Available packages: x86_64, DEB, RPM
 
 ### Build from source
 
