@@ -329,12 +329,11 @@ async fn read_response_headers<R: AsyncBufRead + Unpin>(
                         line[11..].windows(5).any(|w| w.eq_ignore_ascii_case(b"close"));
                 }
             }
-            b't' => {
-                if line.len() >= 18 && line[..18].eq_ignore_ascii_case(b"transfer-encoding:") {
+            b't'
+                if line.len() >= 18 && line[..18].eq_ignore_ascii_case(b"transfer-encoding:") => {
                     is_chunked =
                         line[18..].windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked"));
                 }
-            }
             _ => {}
         }
     }
